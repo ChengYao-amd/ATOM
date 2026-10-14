@@ -1905,6 +1905,8 @@ class Scheduler:
         if self.kv_connector is not None and self.waiting:
             prefetch = getattr(self.kv_connector, "prefetch_lookups", None)
             if prefetch is not None:
+                # Includes requests whose lookup will be detached: the lookup
+                # still refreshes the tier's LRU (`_can_detach_tier_lookup`).
                 prefetch(
                     itertools.islice(self.waiting, 0, envs.OFFLOAD_ASYNC_LOOKUP_DEPTH)
                 )
@@ -2072,9 +2074,23 @@ class Scheduler:
                 continue
 
             offload_resume = self._is_offload_prefill_resume(seq)
+            # Side-effect free: the lookup is detached only after `allocate`
+            # below, so a request held back by the budget or the pool keeps
+            # its prefetched lookup for the next pass. The HBM probe it needs
+            # is kept and reused by the admission probe below.
+            hbm_probe = None
+            lookup_detachable = False
             if (
                 not remote_ready_for_decode
                 and not offload_resume
+                and self._lookup_detach_enabled(seq)
+            ):
+                hbm_probe = self._probe_hbm_prefix(seq)
+                lookup_detachable = self._can_detach_tier_lookup(seq, hbm_probe)
+            if (
+                not remote_ready_for_decode
+                and not offload_resume
+                and not lookup_detachable
                 and self.kv_connector is not None
                 and self._offload_lookup_pending(seq)
             ):
@@ -2082,7 +2098,7 @@ class Scheduler:
                 continue
             needs_remote_load = self._query_connector_prefill_match(
                 seq,
-                skip=remote_ready_for_decode or offload_resume,
+                skip=remote_ready_for_decode or offload_resume or lookup_detachable,
             )
 
             if remote_ready_for_decode:
@@ -2189,13 +2205,9 @@ class Scheduler:
             # (post-prefix-cache) remaining token count. V4 SWA correctness is
             # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
             # where the trailing-window SWA is present); no post-hoc warmup trim.
-            block_hashes = []
-            num_cached_blocks = self.block_manager.can_allocate(
-                seq,
-                record=False,
-                block_hashes=block_hashes,
-                reuse_hashes=self._local_prefill_coalescing,
-            )
+            if hbm_probe is None:
+                hbm_probe = self._probe_hbm_prefix(seq)
+            num_cached_blocks, block_hashes = hbm_probe
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
@@ -2265,6 +2277,21 @@ class Scheduler:
                 self.waiting.appendleft(seq)
                 break
 
+            # Detached before the alloc notification, which reads the save
+            # floor `detach_lookup` sets.
+            if lookup_detachable and not self.kv_connector.detach_lookup(
+                seq, int(seq.num_cached_tokens)
+            ):
+                # `allocate` kept less HBM prefix than the probe offered (e.g.
+                # it disowned a boundary whose state checkpoint was lost), so
+                # a tier load may now be worth it. Undo the admission and let
+                # the next pass take the ordinary path, whose lookup and
+                # remote-load capacity check run before `allocate`.
+                self._decline_lookup_detach(seq)
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
+                break
+
             # The hit the request kept, not the one `can_allocate` offered:
             # `allocate` may disown the boundary, and `num_cached_blocks` is the
             # pre-disown count. `seq.num_cached_tokens` also gets the unit right
@@ -2276,6 +2303,7 @@ class Scheduler:
             if not seq.prefix_cache_hit_tokens:
                 seq.prefix_cache_hit_tokens = seq.num_cached_tokens
 
+            self._lookup_detach_declined.discard(seq.id)
             self._notify_connector_after_prefill_alloc(seq)
 
             # A replay that loads its KV first parks for that load whatever the
@@ -2767,6 +2795,7 @@ class Scheduler:
 
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         self._inflight_prefix_wait.pop(seq.id, None)
+        self._lookup_detach_declined.discard(seq.id)
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
         seq.leave_reason = "aborted"
@@ -2915,6 +2944,69 @@ class Scheduler:
         allocated before it parked for the LMCache load.
         """
         return self._connector_flag("is_offload") and resumes_offload_prefill(seq)
+
+    def _lookup_detach_enabled(self, seq: Sequence) -> bool:
+        """Whether `seq`'s tier lookup is a candidate for detaching at all.
+
+        False when the feature is off, an earlier detach of this request was
+        invalidated by `allocate`, the connector has no offload tier or no
+        detach support, joint KV/state offload is active (a tier hit can
+        change where it resumes), or the request loads remotely.
+        """
+        conn = self.kv_connector
+        return not (
+            not envs.OFFLOAD_SKIP_LOOKUP_ON_HBM_HIT
+            or seq.id in self._lookup_detach_declined
+            or conn is None
+            or not self._connector_flag("is_offload")
+            or getattr(conn, "can_detach_lookup", None) is None
+            or getattr(conn, "detach_lookup", None) is None
+            or getattr(self.block_manager, "state_offload", None) is not None
+            or (seq.kv_transfer_params or {}).get("do_remote_prefill")
+        )
+
+    def _probe_hbm_prefix(self, seq: Sequence) -> tuple[int, list[int]]:
+        """`can_allocate(record=False)`: the HBM hit in blocks (-1 if the
+        request does not fit) and the hash chain it walked.
+
+        Done once per admission attempt; the result is shared by the detach
+        decision and the admission itself, which run in the same pass with no
+        pool change in between.
+        """
+        block_hashes: list[int] = []
+        num_cached_blocks = self.block_manager.can_allocate(
+            seq,
+            record=False,
+            block_hashes=block_hashes,
+            reuse_hashes=self._local_prefill_coalescing,
+        )
+        return num_cached_blocks, block_hashes
+
+    def _can_detach_tier_lookup(
+        self, seq: Sequence, hbm_probe: tuple[int, list[int]]
+    ) -> bool:
+        """Whether admission may proceed without waiting for `seq`'s lookup.
+
+        Side-effect free. Requires an HBM hit and the connector's consent
+        (`can_detach_lookup`, which applies `OFFLOAD_MIN_LOAD_TOKENS`). The
+        probe is the one admission uses, so it sees the HBM prefix
+        `_decide_load_after_alloc` will see.
+        """
+        hit_blocks = hbm_probe[0]
+        if hit_blocks <= 0:
+            return False
+        num_hbm_tokens = hit_blocks * self.block_manager.hash_block_size
+        return bool(self.kv_connector.can_detach_lookup(seq, num_hbm_tokens))
+
+    @property
+    def _lookup_detach_declined(self) -> set:
+        """Requests whose detach `allocate` invalidated; they take the
+        ordinary lookup path until admitted or aborted. Created on first use,
+        so schedulers built without `__init__` (test doubles) work."""
+        return self.__dict__.setdefault("_lookup_detach_declined_ids", set())
+
+    def _decline_lookup_detach(self, seq: Sequence) -> None:
+        self._lookup_detach_declined.add(seq.id)
 
     def _offload_lookup_pending(self, seq: Sequence) -> bool:
         """Whether the connector's lookup for `seq` is still in flight."""
