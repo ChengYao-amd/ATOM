@@ -155,6 +155,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(
         os.getenv("ATOM_PREFIX_CACHE_PROTECTED_RATIO", "0.5")
     ),
+    # DeepSeek-V4 bounded replay: when the compressed history hits further than
+    # the nearest state checkpoint by more than the window's receptive field,
+    # keep the whole hit and recompute only that field (W + (L-1)(W-1) tokens)
+    # to rebuild every layer's window and compressor state exactly.
+    "ATOM_DSV4_STATE_REPLAY": lambda: os.getenv("ATOM_DSV4_STATE_REPLAY", "0").lower()
+    in {"1", "true", "yes", "on"},
     # KV offload without --kv-transfer-config: "lmcache" (in-process LMCache),
     # "lmcache_mp" (standalone `lmcache server`) or "mooncake_store" (a Mooncake
     # Store, no LMCache). Unset = off.
