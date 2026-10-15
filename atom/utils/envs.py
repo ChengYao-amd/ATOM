@@ -1000,6 +1000,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PREFILL_DECODE_INTERVAL": lambda: int(
         os.getenv("ATOM_PREFILL_DECODE_INTERVAL", "0")
     ),
+    # Memoise the delayer's prefix walk across hold ticks
+    # (`BlockManager.can_allocate_memoized`). "0" re-probes every tick.
+    "ATOM_PREFILL_DELAYER_PROBE_MEMO": lambda: (
+        os.getenv("ATOM_PREFILL_DELAYER_PROBE_MEMO", "1") == "1"
+    ),
+    # Hash the prompt block chain in the frontend and ship it to the engine.
+    # "0" leaves all hashing to the engine.
+    "ATOM_FRONTEND_PREFIX_HASH": lambda: (
+        os.getenv("ATOM_FRONTEND_PREFIX_HASH", "1") == "1"
+    ),
+    # One-pass prefix-hit walk (`BlockManager._hit_walk`) whose ids `allocate`
+    # claims. "0" walks block by block with a token compare per block.
+    "ATOM_PREFIX_FAST_WALK": lambda: (os.getenv("ATOM_PREFIX_FAST_WALK", "1") == "1"),
     # --- TBO prefill ubatch splitting ---
     # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
     # cutting through a request if needed for perfectly balanced 50/50 ubatches.
